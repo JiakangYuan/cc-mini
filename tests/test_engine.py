@@ -89,7 +89,7 @@ def test_engine_denied_tool_returns_error_result():
     engine = _make_engine(auto_approve=False)
     streams = _make_tool_then_text_response("Echo", {"message": "hi"}, "tu_2", "ok")
 
-    with patch("builtins.input", return_value="n"):
+    with patch.object(engine._permissions, "_prompt_user", return_value="deny"):
         with patch.object(engine._client.messages, "stream", side_effect=streams):
             events = list(engine.submit("echo hi"))
 

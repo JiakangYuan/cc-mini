@@ -50,14 +50,15 @@ class GrepTool(Tool):
             output = result.stdout.strip()
             return ToolResult(content=output if output else "No matches found.")
         except FileNotFoundError:
-            return self._python_grep(pattern, path, glob, kwargs.get("-i", False))
+            return self._python_grep(pattern, path, glob, kwargs.get("-i", False), output_mode)
         except subprocess.TimeoutExpired:
             return ToolResult(content="Error: Search timed out.", is_error=True)
 
     def _python_grep(self, pattern: str, path: str, glob_filter: str | None,
-                     case_insensitive: bool) -> ToolResult:
+                     case_insensitive: bool, output_mode: str = "files_with_matches") -> ToolResult:
         base = Path(path)
         flags = re.IGNORECASE if case_insensitive else 0
+        regex = re.compile(pattern, flags)
 
         if base.is_file():
             files = [base]
@@ -70,8 +71,14 @@ class GrepTool(Tool):
             if not f.is_file():
                 continue
             try:
-                if re.search(pattern, f.read_text(encoding="utf-8", errors="replace"), flags):
-                    matched.append(str(f))
+                text = f.read_text(encoding="utf-8", errors="replace")
+                if output_mode == "content":
+                    for lineno, line in enumerate(text.splitlines(), 1):
+                        if regex.search(line):
+                            matched.append(f"{f}:{lineno}:{line}")
+                else:
+                    if regex.search(text):
+                        matched.append(str(f))
             except OSError:
                 pass
 
