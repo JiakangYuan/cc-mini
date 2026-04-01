@@ -149,6 +149,9 @@ class Engine:
     def set_session_store(self, store: SessionStore | None) -> None:
         self._session_store = store
 
+    def set_tools(self, tools: list[Tool]) -> None:
+        self._tools = {t.name: t for t in tools}
+
     def get_model(self) -> str:
         return self._model
 

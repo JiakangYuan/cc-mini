@@ -35,6 +35,7 @@ class SessionMeta:
     created_at: str
     updated_at: str
     message_count: int = 0
+    mode: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -110,10 +111,12 @@ class SessionStore:
     """Manages JSONL persistence for a single session."""
 
     def __init__(self, cwd: str, model: str,
-                 session_id: str | None = None):
+                 session_id: str | None = None,
+                 mode: str | None = None):
         self.session_id = session_id or uuid.uuid4().hex
         self.cwd = cwd
         self.model = model
+        self.mode = mode
         self._dir = _SESSIONS_ROOT / _sanitize_cwd(cwd)
         self._dir.mkdir(parents=True, exist_ok=True)
         self._jsonl_path = self._dir / f"{self.session_id}.jsonl"
@@ -147,6 +150,7 @@ class SessionStore:
             created_at=getattr(self, "_created_at", now),
             updated_at=now,
             message_count=self._message_count,
+            mode=self.mode,
         )
         if not hasattr(self, "_created_at"):
             self._created_at = now

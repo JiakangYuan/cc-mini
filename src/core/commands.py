@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING
 from rich.console import Console
 from rich.table import Table
 
+from .coordinator import current_session_mode, match_session_mode
+
 if TYPE_CHECKING:
     from .compact import CompactService
     from .config import AppConfig
@@ -38,6 +40,7 @@ class CommandContext:
     run_dream: object = None
     cost_tracker: CostTracker | None = None
     new_session_store: object = None
+    reconfigure_mode: object = None
 
 
 # ---------------------------------------------------------------------------
@@ -183,10 +186,17 @@ def _cmd_resume(ctx: CommandContext, args: str) -> None:
         return
 
     # Load messages
-    messages = SessionStore.load_messages(target_meta.session_id, cwd)
+    meta, messages = SessionStore.load_session(target_meta.session_id, cwd)
     if not messages:
         ctx.console.print("[red]Session has no messages.[/red]")
         return
+
+    warning = None
+    session_mode = meta.mode if meta is not None else None
+    if callable(ctx.reconfigure_mode):
+        warning = ctx.reconfigure_mode(session_mode)
+    else:
+        warning = match_session_mode(session_mode)
 
     # Create new session store pointing to the resumed session
     new_store = ctx.new_session_store  # type: ignore[call-arg]
@@ -194,6 +204,7 @@ def _cmd_resume(ctx: CommandContext, args: str) -> None:
         cwd=cwd,
         model=ctx.app_config.model,
         session_id=target_meta.session_id,
+        mode=current_session_mode(),
     ) if ctx.session_store else None
 
     ctx.engine.set_messages(messages)
@@ -205,6 +216,8 @@ def _cmd_resume(ctx: CommandContext, args: str) -> None:
         f"[green]✓[/green] Resumed session [bold]{target_meta.session_id[:8]}[/bold]: "
         f"{target_meta.title[:50]}  ({len(messages)} messages)"
     )
+    if warning:
+        ctx.console.print(f"[yellow]{warning}[/yellow]")
 
 
 def _cmd_clear(ctx: CommandContext, args: str) -> None:

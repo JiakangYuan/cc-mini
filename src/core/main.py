@@ -28,6 +28,15 @@ from rich.spinner import Spinner
 from rich.text import Text
 
 from .config import load_app_config
+from .coordinator import (
+    current_session_mode,
+    get_coordinator_system_prompt,
+    get_coordinator_user_context,
+    get_worker_system_prompt,
+    is_coordinator_mode,
+    match_session_mode,
+    set_coordinator_mode,
+)
 from .context import build_system_prompt
 from .cost_tracker import CostTracker
 from .engine import AbortedError, Engine
@@ -39,12 +48,14 @@ from .permissions import PermissionChecker
 from .sandbox.config import load_sandbox_config
 from .sandbox.manager import SandboxManager
 from .tools.ask_user import AskUserQuestionTool
+from .tools.agent import AgentTool, SendMessageTool, TaskStopTool
 from .tools.bash import BashTool
 from .tools.file_edit import FileEditTool
 from .tools.file_read import FileReadTool
 from .tools.file_write import FileWriteTool
 from .tools.glob_tool import GlobTool
 from .tools.grep_tool import GrepTool
+from .worker_manager import WorkerManager
 from .memory import (
     ensure_memory_dir,
     extract_memory_tags,
@@ -501,6 +512,8 @@ def main() -> None:
                         help="Hours between auto-dream runs (default: 24)")
     parser.add_argument("--dream-min-sessions", type=int,
                         help="Minimum new sessions before auto-dream triggers (default: 5)")
+    parser.add_argument("--coordinator", action="store_true",
+                        help="Enable coordinator mode with background workers")
     args = parser.parse_args()
 
     try:
@@ -523,29 +536,84 @@ def main() -> None:
     discover_skills(cwd)
     skills_section = build_skills_prompt_section()
 
-    tools = [
-        FileReadTool(), GlobTool(), GrepTool(),
-        FileEditTool(), FileWriteTool(),
-        BashTool(sandbox_manager=sandbox_mgr),
-        AskUserQuestionTool(),
-    ]
-    system_prompt = build_system_prompt(memory_dir=memory_dir)
-    if skills_section:
-        system_prompt += "\n\n" + skills_section
+    if args.coordinator:
+        set_coordinator_mode(True)
+
+    def _build_base_tools() -> list:
+        return [
+            FileReadTool(), GlobTool(), GrepTool(),
+            FileEditTool(), FileWriteTool(),
+            BashTool(sandbox_manager=sandbox_mgr),
+        ]
+
+    worker_tool_names = [tool.name for tool in _build_base_tools()]
+
+    def _build_system_prompt_for_mode(coordinator_enabled: bool) -> str:
+        prompt = build_system_prompt(cwd=cwd, memory_dir=memory_dir)
+        if skills_section:
+            prompt += "\n\n" + skills_section
+        if coordinator_enabled:
+            extra = get_coordinator_user_context(worker_tool_names)
+            worker_context = extra.get("workerToolsContext")
+            if worker_context:
+                prompt += "\n\n# Coordinator Context\n" + worker_context
+            prompt += "\n\n" + get_coordinator_system_prompt()
+        return prompt
+
     permissions = PermissionChecker(
         auto_approve=args.auto_approve,
         sandbox_manager=sandbox_mgr,
     )
 
+    def _build_worker_engine() -> Engine:
+        worker_permissions = PermissionChecker(
+            auto_approve=True,
+            sandbox_manager=sandbox_mgr,
+        )
+        worker_prompt = build_system_prompt(cwd=cwd, memory_dir=memory_dir)
+        if skills_section:
+            worker_prompt += "\n\n" + skills_section
+        worker_prompt += "\n\n" + get_worker_system_prompt()
+        return Engine(
+            tools=_build_base_tools(),
+            system_prompt=worker_prompt,
+            permission_checker=worker_permissions,
+            provider=app_config.provider,
+            api_key=app_config.api_key,
+            base_url=app_config.base_url,
+            model=app_config.model,
+            max_tokens=app_config.max_tokens,
+            effort=app_config.effort,
+        )
+
+    worker_manager = WorkerManager(build_worker_engine=_build_worker_engine)
+
+    def _build_tools_for_mode(coordinator_enabled: bool) -> list:
+        tools = _build_base_tools()
+        tools.append(AskUserQuestionTool())
+        if coordinator_enabled:
+            tools.extend([
+                AgentTool(worker_manager),
+                SendMessageTool(worker_manager),
+                TaskStopTool(worker_manager),
+            ])
+        return tools
+
+    coordinator_enabled = is_coordinator_mode()
+
     # Session & compact services
     cost_tracker = CostTracker()
     session_store: SessionStore | None = None
     if not args.print:
-        session_store = SessionStore(cwd=cwd, model=app_config.model)
+        session_store = SessionStore(
+            cwd=cwd,
+            model=app_config.model,
+            mode=current_session_mode(),
+        )
 
     engine = Engine(
-        tools=tools,
-        system_prompt=system_prompt,
+        tools=_build_tools_for_mode(coordinator_enabled),
+        system_prompt=_build_system_prompt_for_mode(coordinator_enabled),
         permission_checker=permissions,
         provider=app_config.provider,
         api_key=app_config.api_key,
@@ -562,6 +630,15 @@ def main() -> None:
         effort=app_config.effort,
     )
 
+    def _apply_session_mode(session_mode: str | None) -> str | None:
+        warning = match_session_mode(session_mode)
+        enabled = is_coordinator_mode()
+        engine.set_tools(_build_tools_for_mode(enabled))
+        engine.system_prompt = _build_system_prompt_for_mode(enabled)
+        if session_store is not None:
+            session_store.mode = current_session_mode()
+        return warning
+
     # Handle --resume
     if args.resume and session_store is not None:
         sessions = SessionStore.list_sessions(cwd)
@@ -577,14 +654,21 @@ def main() -> None:
                     target = m
                     break
         if target:
-            msgs = SessionStore.load_messages(target.session_id, cwd)
+            meta, msgs = SessionStore.load_session(target.session_id, cwd)
             if msgs:
+                warning = _apply_session_mode(meta.mode if meta is not None else None)
                 engine.set_messages(msgs)
-                session_store = SessionStore(cwd=cwd, model=app_config.model,
-                                            session_id=target.session_id)
+                session_store = SessionStore(
+                    cwd=cwd,
+                    model=app_config.model,
+                    session_id=target.session_id,
+                    mode=current_session_mode(),
+                )
                 engine.set_session_store(session_store)
                 console.print(f"[green]✓[/green] Resumed: {target.title[:50]}  "
                               f"({len(msgs)} messages)")
+                if warning:
+                    console.print(f"[yellow]{warning}[/yellow]")
         else:
             console.print(f"[red]Session not found: {args.resume}[/red]")
 
@@ -592,6 +676,11 @@ def main() -> None:
     if args.print or args.prompt:
         prompt_text = args.prompt or sys.stdin.read()
         run_query(engine, _parse_input(prompt_text), print_mode=args.print, permissions=permissions)
+        if worker_manager.has_running_tasks():
+            console.print(
+                "\n[dim]Background workers are still running. Use interactive mode "
+                "to receive coordinator task notifications.[/dim]"
+            )
         if cost_tracker.total_cost_usd > 0:
             console.print(f"\n[dim]{cost_tracker.format_cost()}[/dim]")
         return
@@ -601,6 +690,8 @@ def main() -> None:
         f"[dim]{app_config.provider}:{app_config.model} · "
         f"max_tokens={app_config.max_tokens}[/dim]"
     )
+    if is_coordinator_mode():
+        config_note += " [dim yellow]· coordinator[/dim yellow]"
     session_note = f"[dim]session {session_store.session_id[:8]}[/dim]" if session_store else ""
     console.print("[bold cyan]cc-mini[/bold cyan]  "
                   f"{config_note}  {session_note}")
@@ -670,7 +761,20 @@ def main() -> None:
             except Exception:
                 pass
 
+    def _drain_worker_notifications() -> None:
+        if not is_coordinator_mode():
+            return
+        while True:
+            notifications = worker_manager.drain_notifications()
+            if not notifications:
+                return
+            for notification in notifications:
+                console.print("\n[dim]Worker update received.[/dim]")
+                run_query(engine, notification, print_mode=False, permissions=permissions)
+
     while True:
+        _drain_worker_notifications()
+
         # Start/restart animator before each prompt (picks up newly hatched companions)
         if animator is None:
             try:
@@ -777,7 +881,12 @@ def main() -> None:
                 permissions=permissions,
                 run_dream=lambda: _run_dream(engine, memory_dir, permissions),
                 cost_tracker=cost_tracker,
-                new_session_store=lambda: SessionStore(cwd=cwd, model=app_config.model),
+                new_session_store=lambda: SessionStore(
+                    cwd=cwd,
+                    model=app_config.model,
+                    mode=current_session_mode(),
+                ),
+                reconfigure_mode=_apply_session_mode,
             )
             handle_command(cmd_name, cmd_args, cmd_ctx)
             session_store = cmd_ctx.session_store
@@ -824,6 +933,7 @@ def main() -> None:
             continue
 
         run_query(engine, _parse_input(user_input), print_mode=False, permissions=permissions)
+        _drain_worker_notifications()
 
         # Fire companion observer in background after each turn
         try:

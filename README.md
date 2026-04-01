@@ -14,6 +14,7 @@ The core implementation is **~1000 lines of Python**.
 
 | Feature | What it does |
 |---------|--------------|
+| [**Coordinator Mode**](#coordinator-mode) | Runs the assistant as a coordinator that can launch background workers, continue them later, and synthesize their results |
 | [**Buddy**](#buddy--ai-companion) | Tamagotchi-style AI companion pet — watches your sessions, comments in a speech bubble, has persistent personality and stats |
 | [**KAIROS**](#kairos--memory-system) | Cross-session memory system — save notes, auto-consolidates logs into topic files over time |
 | [**Sandbox**](#sandbox) | Runs bash commands inside bubblewrap (bwrap) isolation — filesystem writes and network access restricted |
@@ -25,6 +26,7 @@ The core implementation is **~1000 lines of Python**.
 - **6 built-in tools**: `Read`, `Edit`, `Write`, `Glob`, `Grep`, `Bash`
 - **Permission system** — reads auto-approved; writes and bash commands ask for confirmation
 - **Conversation management** — session persistence, context compression, and resume support
+- **Coordinator mode** — optional orchestration mode with background workers for parallel research, implementation, and verification
 - **Skills** — reusable one-command workflows via `SKILL.md` files, built-in and custom
 
 ---
@@ -125,6 +127,23 @@ The submit() method implements an agentic loop...
 ```
 
 Type `exit` or press `Ctrl+C` to quit.
+
+### Coordinator mode
+
+Launch cc-mini in coordinator mode:
+
+```bash
+cc-mini --coordinator
+```
+
+Or enable it via environment variable:
+
+```bash
+export CC_MINI_COORDINATOR=1
+cc-mini
+```
+
+In coordinator mode, the assistant can use background workers through the `Agent`, `SendMessage`, and `TaskStop` tools. Worker results are delivered back into the main conversation as internal `<task-notification>` messages, so interactive mode is the best fit.
 
 ### One-shot prompt
 
@@ -244,6 +263,9 @@ When `provider = "openai"`, `OPENAI_API_KEY` / `OPENAI_BASE_URL` are used. When 
 | Edit file | `Edit` | requires confirmation |
 | Write file | `Write` | requires confirmation |
 | Run command | `Bash` | requires confirmation |
+| Spawn background worker (coordinator mode) | `Agent` | requires confirmation |
+| Continue background worker (coordinator mode) | `SendMessage` | requires confirmation |
+| Stop background worker (coordinator mode) | `TaskStop` | requires confirmation |
 
 ### Permission prompt
 
@@ -269,6 +291,8 @@ cc-mini automatically saves conversations and can compress long contexts to stay
 ### Session Persistence
 
 Every conversation is saved as a JSONL file under `~/.mini-claude/sessions/`. Messages are appended incrementally — nothing is lost even if the process crashes.
+
+Session metadata also stores whether the conversation was started in normal mode or coordinator mode. When you resume a saved session, cc-mini restores that mode automatically.
 
 ```bash
 # Resume a previous session by index or ID
@@ -308,6 +332,42 @@ How it works:
 | `/history` | List saved sessions for this directory |
 | `/clear` | Clear conversation, start a new session |
 | `/skills` | List all available skills |
+
+---
+
+## Coordinator Mode
+
+> This feature exists in the official Claude Code codebase but has not been fully released by Anthropic. cc-mini implements and ships it.
+
+Coordinator mode turns the main assistant into an orchestrator. Instead of doing every substantial step itself, it can launch background workers to research the codebase, implement targeted changes, or verify work in parallel.
+
+### What it adds
+
+- **Background workers** — launch a worker and keep talking in the main session while it runs
+- **Continuation flow** — continue a completed worker later with more specific instructions
+- **Task notifications** — worker completions are injected back into the main conversation as structured `<task-notification>` messages
+- **Session-aware resume** — resumed sessions automatically restore coordinator mode when needed
+
+### Worker tools
+
+| Tool | Purpose |
+|------|---------|
+| `Agent` | Spawn a background worker with a self-contained prompt |
+| `SendMessage` | Continue an existing worker by task ID |
+| `TaskStop` | Stop a running worker |
+
+### Typical workflow
+
+1. Start `cc-mini --coordinator`
+2. Ask for a larger task such as researching a bug, implementing a fix, or verifying a change
+3. The coordinator launches one or more workers in the background
+4. As workers finish, their results arrive as `<task-notification>` messages
+5. The coordinator synthesizes those results and decides the next step
+
+### Notes
+
+- Workers currently use the standard file/code tools: `Read`, `Glob`, `Grep`, `Edit`, `Write`, and `Bash`
+- Worker execution is asynchronous, so coordinator mode is most useful in the interactive REPL
 
 ---
 
@@ -617,17 +677,19 @@ Dependency errors:
 
 ```
 src/core/
-├── main.py           # CLI entry point + REPL
+├── main.py           # CLI entry point + REPL + coordinator mode wiring
 ├── engine.py         # Streaming API loop + tool execution
 ├── context.py        # System prompt builder (git status, date, memory)
+├── coordinator.py    # Coordinator mode flags, prompts, and session-mode matching
 ├── config.py         # Configuration (CLI, env, TOML)
-├── commands.py       # Slash command system + skill dispatch
-├── session.py        # Session persistence (JSONL)
+├── commands.py       # Slash command system + skill dispatch + resume handling
+├── session.py        # Session persistence (JSONL + session mode metadata)
 ├── compact.py        # Context window compaction
 ├── skills.py         # Skill loader, registry, and discovery
 ├── skills_bundled.py # Built-in skills (simplify, review, commit, test)
 ├── memory.py         # KAIROS memory system (logs, dream, sessions)
 ├── permissions.py    # Permission checker + sandbox auto-allow
+├── worker_manager.py # Background worker lifecycle + task notifications
 ├── _keylistener.py   # Esc/Ctrl+C detection
 ├── sandbox/          # Sandbox subsystem (bwrap isolation)
 │   ├── config.py         # SandboxConfig dataclass + TOML persistence
@@ -642,7 +704,8 @@ src/core/
 │   ├── file_write.py
 │   ├── glob_tool.py
 │   ├── grep_tool.py
-│   └── bash.py       # Bash tool with sandbox integration
+│   ├── bash.py       # Bash tool with sandbox integration
+│   └── agent.py      # Coordinator-only tools: Agent, SendMessage, TaskStop
 └── buddy/
     ├── types.py      # Data model: species, rarity, stats
     ├── companion.py  # Mulberry32 PRNG + deterministic generation
