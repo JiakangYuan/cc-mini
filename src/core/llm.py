@@ -50,7 +50,7 @@ def validate_provider(provider: str | None) -> ProviderName:
 def default_model_for_provider(provider: str) -> str:
     provider = validate_provider(provider)
     if provider == _OPENAI_PROVIDER:
-        return "gpt-4.1-mini"
+        return "gpt-5.1-codex"
     return "claude-sonnet-4-20250514"
 
 
